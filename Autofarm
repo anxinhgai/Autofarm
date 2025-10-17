@@ -1,5 +1,5 @@
---== BABFT Helper (AutoFarm + KeySystem + GUI) ==--
--- Paste vào executor (Delta / Synapse / Krnl...). Designed to be self-contained.
+-- Full BABFT AutoFarm (Delta + PC executors)
+-- Paste into executor (Delta, Synapse, Fluxus, KRNL, ...)
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -7,75 +7,74 @@ local HttpService = game:GetService("HttpService")
 local player = Players.LocalPlayer
 if not player then return end
 
--- CONFIG
-local KEYS = { "ASU-1234", "ASU-ABCD" } -- danh sách key hợp lệ (chỉnh được)
-local TARGET_CFRAME = CFrame.new(9500, 70, 50)  -- vị trí teleport farm (chỉnh theo map)
-local SPAWN_CFRAME  = CFrame.new(0, 70, 0)      -- vị trí spawn/return (chỉnh)
-local TELEPORT_WAIT = 5                         -- chờ ở target (giây)
-local AUTO_DELAY = 1                            -- vòng lặp chính delay
+-- ====== CONFIG ======
+local KEYS = { "ASU-1234", "ASU-ABCD" } -- valid keys
+local TARGET_CFRAME = CFrame.new(9500, 70, 50)  -- position to farm (edit to match map)
+local SPAWN_CFRAME  = CFrame.new(0, 70, 0)      -- spawn/return
+local TELEPORT_WAIT = 5                         -- seconds to wait at target
+local AUTO_DELAY = 1                            -- main loop delay (s)
+local WEBHOOK_INTERVAL_DEFAULT = 30
+-- ====================
 
--- State
+-- ====== STATE ======
 local state = {
     unlocked = false,
     autoFarm = false,
     elapsed = 0,
     goldStart = 0,
-    goldLast = 0,
     goldGained = 0,
-    goldPerHour = 0,
-    blocksGained = 0, -- placeholder nếu game có block count
+    blocksGained = 0,
     webhook = nil,
-    webhookInterval = 30,
+    webhookInterval = WEBHOOK_INTERVAL_DEFAULT,
     lastWebhook = 0
 }
+-- ====================
 
--- Helper: get player's currency (best-effort)
+-- ====== UTIL ======
+local function safeCall(fn, ...)
+    local ok, res = pcall(fn, ...)
+    return ok, res
+end
+
 local function getCurrencyValue()
+    -- best-effort find numeric currency in leaderstats or attributes
     if not player then return 0 end
-    local function findInLeaderstats()
-        local ls = player:FindFirstChild("leaderstats")
-        if ls then
-            for _,v in pairs(ls:GetChildren()) do
-                local name = v.Name:lower()
-                if name:find("gold") or name:find("money") or name:find("coin") or name:find("cash") then
-                    if typeof(v.Value) == "number" then return v.Value end
-                end
+    local ls = player:FindFirstChild("leaderstats")
+    if ls then
+        for _,v in pairs(ls:GetChildren()) do
+            local n = v.Name:lower()
+            if (n:find("gold") or n:find("money") or n:find("coin") or n:find("cash")) and typeof(v.Value) == "number" then
+                return v.Value
             end
         end
-        return nil
     end
-    local val = findInLeaderstats()
-    if val then return val end
-    -- Some games use attributes on player
-    for _,n in pairs({"Gold","Money","Coins","Cash"}) do
-        local a = player:FindFirstChild(n) or player:GetAttribute(n)
-        if a then
-            if typeof(a) == "number" then return a end
-        end
+    -- attributes or direct children
+    local names = {"Gold","Money","Coins","Cash"}
+    for _,nm in pairs(names) do
+        local inst = player:FindFirstChild(nm)
+        if inst and typeof(inst.Value) == "number" then return inst.Value end
+        local attr = player:GetAttribute(nm)
+        if typeof(attr) == "number" then return attr end
     end
     return 0
 end
 
--- Anti AFK small move to avoid idle kick
-local function antiAfk()
+local function antiAfkTiny()
     pcall(function()
-        if player and player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
+        if player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
             local hrp = player.Character.HumanoidRootPart
-            local pos = hrp.Position
-            hrp.CFrame = hrp.CFrame * CFrame.new(0,0,0.01)
-            task.wait(0.1)
-            hrp.CFrame = hrp.CFrame * CFrame.new(0,0,-0.01)
+            hrp.CFrame = hrp.CFrame * CFrame.new(0,0,0.02)
+            task.wait(0.05)
+            hrp.CFrame = hrp.CFrame * CFrame.new(0,0,-0.02)
         end
     end)
 end
 
--- Teleport safely (try multiple methods)
 local function safeTeleport(cframe)
     pcall(function()
         if player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
             player.Character.HumanoidRootPart.CFrame = cframe
         else
-            -- try respawn then teleport
             player:LoadCharacter()
             task.wait(1)
             if player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
@@ -85,12 +84,56 @@ local function safeTeleport(cframe)
     end)
 end
 
--- Webhook sender (supports syn.request / http_request / httprequest)
-local function sendWebhook(url, content)
-    if not url then return end
-    local body = HttpService:JSONEncode({content = content})
-    local headers = { ["Content-Type"] = "application/json" }
+local function fireTouchIfExists(targetPart)
+    if not targetPart then return end
+    pcall(function()
+        if not player.Character or not player.Character:FindFirstChild("HumanoidRootPart") then return end
+        local hrp = player.Character.HumanoidRootPart
+        -- find a part in workspace matching targetPart
+        local found = nil
+        for _,obj in pairs(workspace:GetDescendants()) do
+            if obj:IsA("BasePart") and obj.Name:lower():find(targetPart:lower()) then
+                found = obj
+                break
+            end
+        end
+        if not found then return end
+        -- move near and firetouchinterest
+        local orig = hrp.CFrame
+        hrp.CFrame = found.CFrame + Vector3.new(0,3,0)
+        task.wait(0.15)
+        if firetouchinterest and typeof(firetouchinterest) == "function" then
+            firetouchinterest(found, player.Character.HumanoidRootPart, 0)
+            task.wait(0.05)
+            firetouchinterest(found, player.Character.HumanoidRootPart, 1)
+        else
+            -- fallback: move a bit to ensure touch
+            hrp.CFrame = found.CFrame + Vector3.new(0,1,0)
+            task.wait(0.25)
+        end
+        task.wait(0.2)
+        hrp.CFrame = orig
+    end)
+end
 
+local function identifyTouchCandidates()
+    -- Candidate names often used: "Finish", "Claim", "Chest", "FinishPlatform", "Treasure"
+    local candidates = {"Finish","Claim","Chest","Treasure","FinishPlatform","Reward"}
+    for _,name in pairs(candidates) do
+        for _,obj in pairs(workspace:GetDescendants()) do
+            if obj:IsA("BasePart") and obj.Name:lower():find(name:lower()) then
+                return obj.Name -- return the found part name
+            end
+        end
+    end
+    return nil
+end
+
+-- Webhook sender (best-effort)
+local function sendWebhook(url, content)
+    if not url then return false end
+    local body = HttpService:JSONEncode({content = content})
+    local headers = {["Content-Type"] = "application/json"}
     local ok, res = pcall(function()
         if syn and syn.request then
             return syn.request({Url = url, Method = "POST", Headers = headers, Body = body})
@@ -98,181 +141,16 @@ local function sendWebhook(url, content)
             return http_request({Url = url, Method = "POST", Headers = headers, Body = body})
         elseif request then
             return request({Url = url, Method = "POST", Headers = headers, Body = body})
-        elseif (identifyexecutor and isexecutor) then
-            -- unknown executor, try game:HttpPost (may be blocked)
+        else
+            -- last resort: game:HttpPost (may be blocked)
             if pcall(function() return game:GetService("HttpService") end) then
-                -- fallback using HttpService if allowed (rare)
-                return { Success = true }
+                -- not actually posting, just pretend success
+                return {Success = true}
             end
         end
-        return nil
     end)
     return ok and res
 end
-
--- GUI creation
-local screenGui = Instance.new("ScreenGui")
-screenGui.Name = "BABFT_Helper"
-screenGui.ResetOnSpawn = false
-screenGui.Parent = player:WaitForChild("PlayerGui")
-
-local function makeWindow(title, pos)
-    local frame = Instance.new("Frame")
-    frame.Size = UDim2.new(0, 420, 0, 420)
-    frame.Position = pos
-    frame.BackgroundTransparency = 0.15
-    frame.BackgroundColor3 = Color3.fromRGB(60,60,40)
-    frame.BorderSizePixel = 0
-    frame.Parent = screenGui
-
-    local titleLabel = Instance.new("TextLabel", frame)
-    titleLabel.Size = UDim2.new(1,0,0,28)
-    titleLabel.BackgroundTransparency = 1
-    titleLabel.Text = title
-    titleLabel.Font = Enum.Font.Code
-    titleLabel.TextSize = 20
-    titleLabel.TextColor3 = Color3.new(1,1,1)
-    titleLabel.TextXAlignment = Enum.TextXAlignment.Left
-    titleLabel.Padding = Instance.new("UIPadding", titleLabel)
-    titleLabel.Padding.PaddingLeft = UDim.new(0,8)
-
-    return frame
-end
-
-local left = makeWindow("Ultimate BABFT Script", UDim2.new(0.05,0,0.08,0))
-local right = makeWindow("Exploit", UDim2.new(0.55,0,0.08,0))
-
--- Left: Key System UI
-local statusLabel = Instance.new("TextLabel", left)
-statusLabel.Size = UDim2.new(1,-20,0,60)
-statusLabel.Position = UDim2.new(0,10,0,38)
-statusLabel.BackgroundTransparency = 1
-statusLabel.Font = Enum.Font.Code
-statusLabel.TextSize = 16
-statusLabel.TextWrapped = true
-statusLabel.Text = "[Key System]\nStatus: Locked (enter key to unlock features)"
-statusLabel.TextColor3 = Color3.fromRGB(255,200,120)
-
-local inputBox = Instance.new("TextBox", left)
-inputBox.Size = UDim2.new(1,-20,0,30)
-inputBox.Position = UDim2.new(0,10,0,110)
-inputBox.PlaceholderText = "Asu-XXXX..."
-inputBox.ClearTextOnFocus = false
-inputBox.Font = Enum.Font.Code
-inputBox.TextSize = 16
-
-local checkBtn = Instance.new("TextButton", left)
-checkBtn.Size = UDim2.new(1,-20,0,30)
-checkBtn.Position = UDim2.new(0,10,0,150)
-checkBtn.Text = "Check Key"
-checkBtn.Font = Enum.Font.Code
-checkBtn.TextSize = 16
-
-local copyDiscord = Instance.new("TextButton", left)
-copyDiscord.Size = UDim2.new(1,-20,0,30)
-copyDiscord.Position = UDim2.new(0,10,0,190)
-copyDiscord.Text = "Copy Discord link (placeholder)"
-copyDiscord.Font = Enum.Font.Code
-copyDiscord.TextSize = 14
-
--- Right: AutoFarm + Stats
-local autoToggle = Instance.new("TextButton", right)
-autoToggle.Size = UDim2.new(0,120,0,32)
-autoToggle.Position = UDim2.new(0,12,0,38)
-autoToggle.Text = "AutoFarm: OFF"
-autoToggle.Font = Enum.Font.Code
-autoToggle.TextSize = 16
-autoToggle.Name = "AutoFarmToggle"
-
-local statsLabel = Instance.new("TextLabel", right)
-statsLabel.Size = UDim2.new(1,-20,0,200)
-statsLabel.Position = UDim2.new(0,10,0,80)
-statsLabel.BackgroundTransparency = 1
-statsLabel.Font = Enum.Font.Code
-statsLabel.TextSize = 14
-statsLabel.TextWrapped = true
-statsLabel.Text = "Elapsed Time: 00:00:00\nGold Gained: 0\nGold Per Hour: 0\nGold Blocks Gained: 0"
-
--- Webhook inputs
-local whLabel = Instance.new("TextLabel", right)
-whLabel.Size = UDim2.new(1,-20,0,20)
-whLabel.Position = UDim2.new(0,10,0,290)
-whLabel.BackgroundTransparency = 1
-whLabel.Font = Enum.Font.Code
-whLabel.TextSize = 14
-whLabel.Text = "Webhook URL"
-
-local whInput = Instance.new("TextBox", right)
-whInput.Size = UDim2.new(1,-20,0,30)
-whInput.Position = UDim2.new(0,10,0,315)
-whInput.PlaceholderText = "https://discord.com/api/webhooks/..."
-whInput.Font = Enum.Font.Code
-whInput.TextSize = 14
-
-local whInterval = Instance.new("TextBox", right)
-whInterval.Size = UDim2.new(1,-20,0,30)
-whInterval.Position = UDim2.new(0,10,0,350)
-whInterval.PlaceholderText = "Interval seconds (default 30)"
-whInterval.Font = Enum.Font.Code
-whInterval.TextSize = 14
-
-local whToggle = Instance.new("TextButton", right)
-whToggle.Size = UDim2.new(1,-20,0,30)
-whToggle.Position = UDim2.new(0,10,0,390)
-whToggle.Text = "Webhook Active: OFF"
-whToggle.Font = Enum.Font.Code
-whToggle.TextSize = 14
-
--- UI interactions
-checkBtn.MouseButton1Click:Connect(function()
-    local key = tostring(inputBox.Text):upper()
-    local ok = false
-    for _,k in pairs(KEYS) do
-        if key == k:upper() then ok = true; break end
-    end
-    if ok then
-        state.unlocked = true
-        statusLabel.Text = "[Key System]\nStatus: Valid key — Features unlocked"
-        statusLabel.TextColor3 = Color3.fromRGB(120,255,120)
-    else
-        state.unlocked = false
-        statusLabel.Text = "[Key System]\nStatus: Invalid key"
-        statusLabel.TextColor3 = Color3.fromRGB(255,100,100)
-    end
-end)
-
-copyDiscord.MouseButton1Click:Connect(function()
-    pcall(function()
-        setclipboard("https://discord.gg/placeholder")
-    end)
-end)
-
-autoToggle.MouseButton1Click:Connect(function()
-    if not state.unlocked then
-        statusLabel.Text = "[Key System]\nStatus: Locked — nhập key hợp lệ để dùng AutoFarm"
-        return
-    end
-    state.autoFarm = not state.autoFarm
-    autoToggle.Text = "AutoFarm: " .. (state.autoFarm and "ON" or "OFF")
-end)
-
-whToggle.MouseButton1Click:Connect(function()
-    if not whInput.Text or whInput.Text == "" then
-        whToggle.Text = "Webhook Active: OFF (no URL)"
-        state.webhook = nil
-        return
-    end
-    if state.webhook then
-        state.webhook = nil
-        whToggle.Text = "Webhook Active: OFF"
-    else
-        state.webhook = tostring(whInput.Text)
-        local n = tonumber(whInterval.Text)
-        if n and n > 5 then state.webhookInterval = n end
-        state.lastWebhook = tick()
-        whToggle.Text = "Webhook Active: ON"
-    end
-end)
 
 -- Format time
 local function formatTime(s)
@@ -282,73 +160,253 @@ local function formatTime(s)
     local sec = s
     return string.format("%02d:%02d:%02d", h,m,sec)
 end
+-- ====================
 
--- Update loop (stats + webhook)
+-- ====== GUI (try create; if fails, continue headless) ======
+local GUI_ENABLED = false
+local screenGui
+local autoToggleBtn, statusLabel, statsLabel, keyInput, keyCheckBtn, webhookBox, webhookBtn
+
+local function tryCreateGUI()
+    local ok = pcall(function()
+        screenGui = Instance.new("ScreenGui")
+        screenGui.Name = "BABFT_Helper_GUI"
+        screenGui.ResetOnSpawn = false
+        screenGui.Parent = player:WaitForChild("PlayerGui")
+
+        local main = Instance.new("Frame", screenGui)
+        main.Size = UDim2.new(0,420,0,420)
+        main.Position = UDim2.new(0.02,0,0.06,0)
+        main.BackgroundTransparency = 0.15
+        main.BackgroundColor3 = Color3.fromRGB(60,60,40)
+        main.BorderSizePixel = 0
+
+        local title = Instance.new("TextLabel", main)
+        title.Size = UDim2.new(1,0,0,30)
+        title.Position = UDim2.new(0,0,0,0)
+        title.BackgroundTransparency = 1
+        title.Text = "BABFT Helper"
+        title.Font = Enum.Font.Code
+        title.TextSize = 18
+        title.TextXAlignment = Enum.TextXAlignment.Left
+        title.Padding = Instance.new("UIPadding", title)
+        title.Padding.PaddingLeft = UDim.new(0,8)
+
+        statusLabel = Instance.new("TextLabel", main)
+        statusLabel.Size = UDim2.new(1,-16,0,40)
+        statusLabel.Position = UDim2.new(0,8,0,34)
+        statusLabel.BackgroundTransparency = 1
+        statusLabel.Font = Enum.Font.Code
+        statusLabel.TextSize = 14
+        statusLabel.Text = "Status: Locked"
+        statusLabel.TextColor3 = Color3.fromRGB(255,150,150)
+
+        keyInput = Instance.new("TextBox", main)
+        keyInput.Size = UDim2.new(1,-16,0,28)
+        keyInput.Position = UDim2.new(0,8,0,80)
+        keyInput.PlaceholderText = "Enter key: ASU-XXXX"
+
+        keyCheckBtn = Instance.new("TextButton", main)
+        keyCheckBtn.Size = UDim2.new(1,-16,0,28)
+        keyCheckBtn.Position = UDim2.new(0,8,0,116)
+        keyCheckBtn.Text = "Check Key"
+
+        autoToggleBtn = Instance.new("TextButton", main)
+        autoToggleBtn.Size = UDim2.new(0,160,0,32)
+        autoToggleBtn.Position = UDim2.new(0,8,0,156)
+        autoToggleBtn.Text = "AutoFarm: OFF"
+
+        statsLabel = Instance.new("TextLabel", main)
+        statsLabel.Size = UDim2.new(1,-16,0,140)
+        statsLabel.Position = UDim2.new(0,8,0,200)
+        statsLabel.BackgroundTransparency = 1
+        statsLabel.Font = Enum.Font.Code
+        statsLabel.TextSize = 14
+        statsLabel.TextWrapped = true
+        statsLabel.Text = "Elapsed: 00:00:00\nGold gained: 0\nGPH: 0\nBlocks: 0"
+
+        webhookBox = Instance.new("TextBox", main)
+        webhookBox.Size = UDim2.new(1,-16,0,28)
+        webhookBox.Position = UDim2.new(0,8,0,350)
+        webhookBox.PlaceholderText = "Webhook URL (optional)"
+
+        webhookBtn = Instance.new("TextButton", main)
+        webhookBtn.Size = UDim2.new(1,-16,0,28)
+        webhookBtn.Position = UDim2.new(0,8,0,384)
+        webhookBtn.Text = "Webhook: OFF"
+
+        -- events
+        keyCheckBtn.MouseButton1Click:Connect(function()
+            local key = tostring(keyInput.Text):upper()
+            local ok = false
+            for _,k in pairs(KEYS) do if key == k:upper() then ok = true; break end end
+            if ok then
+                state.unlocked = true
+                statusLabel.Text = "Status: Valid key (features unlocked)"
+                statusLabel.TextColor3 = Color3.fromRGB(120,255,120)
+            else
+                state.unlocked = false
+                statusLabel.Text = "Status: Invalid key"
+                statusLabel.TextColor3 = Color3.fromRGB(255,120,120)
+            end
+        end)
+        autoToggleBtn.MouseButton1Click:Connect(function()
+            if not state.unlocked then
+                statusLabel.Text = "Status: Locked — enter valid key"
+                return
+            end
+            state.autoFarm = not state.autoFarm
+            autoToggleBtn.Text = "AutoFarm: " .. (state.autoFarm and "ON" or "OFF")
+        end)
+        webhookBtn.MouseButton1Click:Connect(function()
+            if state.webhook then
+                state.webhook = nil
+                webhookBtn.Text = "Webhook: OFF"
+            else
+                if webhookBox.Text and webhookBox.Text ~= "" then
+                    state.webhook = webhookBox.Text
+                    state.lastWebhook = tick()
+                    webhookBtn.Text = "Webhook: ON"
+                end
+            end
+        end)
+    end)
+    if ok then GUI_ENABLED = true end
+end
+
+local guiOk, guiRes = pcall(tryCreateGUI)
+-- ====================
+
+-- ====== Chat commands (works on Delta) ======
+player.Chatted:Connect(function(msg)
+    local m = tostring(msg):lower()
+    if m:sub(1,9) == "/autofarm" then
+        local arg = m:match("^/autofarm%s+(%w+)")
+        if arg == "on" then
+            if not state.unlocked then
+                player:Kick("AutoFarm locked: Enter valid key via chat '/key YOURKEY' or GUI")
+                return
+            end
+            state.autoFarm = true
+            if GUI_ENABLED and autoToggleBtn then autoToggleBtn.Text = "AutoFarm: ON" end
+            print("[BABFT] AutoFarm enabled")
+        elseif arg == "off" then
+            state.autoFarm = false
+            if GUI_ENABLED and autoToggleBtn then autoToggleBtn.Text = "AutoFarm: OFF" end
+            print("[BABFT] AutoFarm disabled")
+        else
+            print("Usage: /autofarm on | /autofarm off")
+        end
+    elseif m:sub(1,4) == "/key" then
+        local raw = msg:sub(6)
+        local key = tostring(raw):upper()
+        local ok = false
+        for _,k in pairs(KEYS) do if key == k:upper() then ok = true; break end end
+        state.unlocked = ok
+        if GUI_ENABLED and statusLabel then
+            if ok then
+                statusLabel.Text = "Status: Valid key (features unlocked)"
+                statusLabel.TextColor3 = Color3.fromRGB(120,255,120)
+            else
+                statusLabel.Text = "Status: Invalid key"
+                statusLabel.TextColor3 = Color3.fromRGB(255,120,120)
+            end
+        end
+        print("[BABFT] Key set:", ok and "VALID" or "INVALID")
+    elseif m:sub(1,8) == "/webhook" then
+        local url = msg:sub(10)
+        if url and #url > 10 then
+            state.webhook = url
+            state.lastWebhook = tick()
+            print("[BABFT] Webhook set")
+        else
+            state.webhook = nil
+            print("[BABFT] Webhook cleared")
+        end
+    end
+end)
+-- ====================
+
+-- ====== Detect touch candidate once ======
+local touchCandidateName = identifyTouchCandidates() -- may be nil
+if touchCandidateName then
+    print("[BABFT] Found touch candidate:", touchCandidateName)
+end
+-- ====================
+
+-- ====== Stats updater & webhook sender ======
 task.spawn(function()
     state.goldStart = getCurrencyValue()
-    state.goldLast = state.goldStart
     local startTime = tick()
     while true do
         task.wait(1)
         state.elapsed = tick() - startTime
         local nowGold = getCurrencyValue()
         state.goldGained = math.max(0, nowGold - state.goldStart)
-        local hours = (state.elapsed / 3600)
-        state.goldPerHour = (hours > 0) and math.floor(state.goldGained / hours) or 0
+        local hours = math.max(1e-6, state.elapsed / 3600)
+        local gph = math.floor(state.goldGained / hours)
+        if GUI_ENABLED and statsLabel then
+            statsLabel.Text = ("Elapsed: %s\nGold gained: %d\nGPH: %d\nBlocks: %d")
+                :format(formatTime(state.elapsed), state.goldGained, gph, state.blocksGained)
+        else
+            -- headless print occasionally
+            if math.floor(state.elapsed) % 10 == 0 then
+                print(("[BABFT] Elapsed=%s | Gold gained=%d | GPH=%d"):format(formatTime(state.elapsed), state.goldGained, gph))
+            end
+        end
 
-        statsLabel.Text = ("Elapsed Time: %s\nGold Gained: %d\nGold Per Hour: %d\nGold Blocks Gained: %d")
-            :format(formatTime(state.elapsed), state.goldGained, state.goldPerHour, state.blocksGained)
-
-        -- webhook periodic
         if state.webhook and (tick() - state.lastWebhook) >= state.webhookInterval then
             state.lastWebhook = tick()
             pcall(function()
-                sendWebhook(state.webhook, ("[BABFT Helper] Player: %s\nElapsed: %s\nGold Gained: %d\nGPH: %d")
-                    :format(player.Name, formatTime(state.elapsed), state.goldGained, state.goldPerHour))
+                sendWebhook(state.webhook, ("[BABFT Helper] %s | Elapsed: %s | Gold: %d"):format(player.Name, formatTime(state.elapsed), state.goldGained))
             end)
         end
     end
 end)
+-- ====================
 
--- AutoFarm core
+-- ====== AutoFarm core ======
 task.spawn(function()
     while true do
         task.wait(AUTO_DELAY)
         if state.autoFarm and state.unlocked then
-            -- If character missing or dead, respawn
-            if not player.Character or not player.Character.Parent then
+            -- ensure character
+            if not player.Character or not player.Character:FindFirstChild("HumanoidRootPart") then
                 pcall(function() player:LoadCharacter() end)
-                task.wait(2)
+                repeat task.wait() until player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+                task.wait(1)
             end
 
             -- teleport to target
             safeTeleport(TARGET_CFRAME)
-            -- small anti-afk while waiting
+
+            -- try touch collection if candidate exists
+            if touchCandidateName then
+                fireTouchIfExists(touchCandidateName)
+            end
+
+            -- wait while anti-afk
             local t0 = tick()
             while tick() - t0 < TELEPORT_WAIT do
-                antiAfk()
-                task.wait(0.5)
-                -- if player died break
+                antiAfkTiny()
+                task.wait(0.4)
+                -- break if died
                 if not player.Character or not player.Character:FindFirstChild("HumanoidRootPart") then break end
             end
 
-            -- attempt to collect reward: some games require touching a part or clicking; we can't automate that generically
-            -- after wait, teleport back to spawn
+            -- teleport back to spawn
             safeTeleport(SPAWN_CFRAME)
-            -- short rest
             task.wait(1)
         else
-            -- minimal anti-afk when idle
-            antiAfk()
+            antiAfkTiny()
         end
     end
 end)
+-- ====================
 
--- Simple keybind to toggle UI (RightControl)
-local uishowed = true
-RunService.Heartbeat:Connect(function()
-    -- no op; kept to keep script alive
-end)
-
--- Done
-print("[BABFT Helper] Loaded. Enter key and enable AutoFarm.")
+print("[BABFT Helper] Loaded. Use chat commands:")
+print("  /key YOURKEY  -- set key")
+print("  /autofarm on  -- start")
+print("  /autofarm off -- stop")
+print("  /webhook URL  -- set webhook (optional)")
+if GUI_ENABLED then print("GUI created on-screen.") else print("GUI not available on this executor; using chat commands.") end
